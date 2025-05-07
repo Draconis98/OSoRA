@@ -29,6 +29,11 @@ from .config import OSoraConfig
 from .layer import Linear, OSoraLayer
 
 
+def _adapter_names_pre_forward_hook(target, args, kwargs, adapter_names):
+    kwargs["adapter_names"] = adapter_names
+    return args, kwargs
+
+
 class OSoraModel(BaseTuner):
     """
     Creates Only Singular Value Low-rank Adaptation (OSora) model from a pretrained transformers model.
@@ -114,6 +119,8 @@ class OSoraModel(BaseTuner):
             "r": r,
             "osora_dropout": osora_config.osora_dropout,
             "fan_in_fan_out": osora_config.fan_in_fan_out,
+            "init_osora_weights": osora_config.init_osora_weights,
+            "use_dora": osora_config.use_dora,
         }
 
         # TODO: add quantization support
@@ -123,6 +130,8 @@ class OSoraModel(BaseTuner):
                 adapter_name,
                 r,
                 osora_config.osora_dropout,
+                osora_config.init_osora_weights,
+                use_dora=osora_config.use_dora,
             )
         else:
             new_module = self._create_new_module(osora_config, adapter_name, target, **kwargs)
@@ -160,8 +169,26 @@ class OSoraModel(BaseTuner):
                     module.to(child.weight.device)
 
     def _mark_only_adapters_as_trainable(self, model: nn.Module) -> None:
+        osora_S = self.prefix + "S"
+        osora_O = self.prefix + "O"
+        
+        fixed_vector = None
+        for active_adapter in self.active_adapters:
+            if isinstance(self.peft_config[active_adapter].init_osora_weights, str) and \
+                self.peft_config[active_adapter].init_osora_weights.lower() == "fix_O":
+                fixed_vector = osora_O
+            elif isinstance(self.peft_config[active_adapter].init_osora_weights, str) and \
+                self.peft_config[active_adapter].init_osora_weights.lower() == "fix_S":
+                fixed_vector = osora_S
+
+        use_dora = self.peft_config[active_adapter].use_dora
+        if use_dora:
+            osora_magnitude_vector = self.prefix + "magnitude_vector"
+
         for n, p in model.named_parameters():
-            if self.prefix + "S" not in n and self.prefix + "O" not in n:
+            if osora_S not in n and osora_O not in n and (not use_dora or osora_magnitude_vector not in n):
+                p.requires_grad = False
+            elif fixed_vector is not None and fixed_vector in n:
                 p.requires_grad = False
 
         for active_adapter in self.active_adapters:

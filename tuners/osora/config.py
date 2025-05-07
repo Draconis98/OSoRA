@@ -1,6 +1,6 @@
 import warnings
 from dataclasses import dataclass, field
-from typing import List, Optional, Union
+from typing import List, Optional, Union, Literal
 
 from peft.config import PeftConfig
 from peft.utils import PeftType
@@ -39,6 +39,23 @@ class OSoraConfig(PeftConfig):
                 "List of modules apart from OSora layers to be set as trainable and saved in the final checkpoint."
                 "For example, in Sequence Classification or Token Classification tasks, the final layer"
                 "`classifier/score` are randomly initialized and as such need to be trainable and saved."
+            )
+        }
+    )
+    
+
+    init_osora_weights: Literal["default", "gaussian", "kaiming", "zeros", "in_features", "fix_O", "fix_S"] = field(
+        default="default",
+        metadata={
+            "help": (
+                "How to initialize the weights of the OSora layer."
+                "Pass `'default'` (default) to use the default initialization."
+                "Pass `'gaussian'` to use Gaussian initialization."
+                "Pass `'kaiming'` to use Kaiming initialization."
+                "Pass `'zeros'` to initialize the weights to zeros."
+                "Pass `'in_features'` to initialize the weights to the in_features of the layer."
+                "Pass `'fix_O'` to fix the weights of osora_O."
+                "Pass `'fix_S'` to fix the weights of osora_S."
             )
         }
     )
@@ -84,6 +101,46 @@ class OSoraConfig(PeftConfig):
         },
     )
 
+    use_dora: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Enable <a href='https://arxiv.org/abs/2402.09353'>'Weight-Decomposed Low-Rank Adaptation' (DoRA)</a>. This technique decomposes the updates of the "
+                "weights into two parts, magnitude and direction. Direction is handled by normal LoRA, whereas the "
+                "magnitude is handled by a separate learnable parameter. This can improve the performance of LoRA, "
+                "especially at low ranks. Right now, DoRA only supports linear and Conv2D layers. DoRA introduces a bigger"
+                "overhead than pure LoRA, so it is recommended to merge weights for inference."
+            )
+        }
+    )
+    
+    # use_in_feature_ones: bool = field(
+    #     default=False,
+    #     metadata={
+    #         "help": (
+    #             "If False (default), osora_O's dimension will be out_feature. If True, osora_O's dimension will be in_feature."
+    #         )
+    #     }
+    # )
+
+    # no_ones: bool = field(
+    #     default=False,
+    #     metadata={
+    #         "help": (
+    #             "If True, osora_O will not be initialized to ones."
+    #         )
+    #     }
+    # )
+
+    # fix_O_or_S: Optional[str] = field(
+    #     default=None,
+    #     metadata={
+    #         "help": (
+    #             "If specified, osora_O or osora_S will not be updated during training."
+    #         )
+    #     }
+    # )
+    
     def __post_init__(self):
         self.peft_type = PeftType.OSORA
         self.target_modules = (

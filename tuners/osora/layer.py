@@ -1,25 +1,31 @@
+from __future__ import annotations
+
+import math
 import warnings
-from typing import List, Optional
+from typing import List, Optional, Any, Union
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers.pytorch_utils import Conv1D
 
 from peft.tuners.tuners_utils import BaseTunerLayer, check_adapters_to_merge
 from peft.utils.other import transpose
 
-from loguru import logger
+from .dora import DoraLinearLayer
+
 
 class OSoraLayer(BaseTunerLayer):
     adapter_layer_names = ("osora_S", "osora_O") # tranable
-    other_param_names = ("osora_U", "osora_V") # fixed
+    other_param_names = ("osora_U", "osora_V", "osora_dropout", "init_osora_weights") # fixed
 
-    def __init__(self, base_layer: nn.Module, **kwargs):
+    def __init__(self, base_layer: nn.Module, ephemeral_gpu_offload: bool = False, **kwargs) -> None:
         self.base_layer = base_layer
         self.r = {}
         self.osora_dropout = nn.ModuleDict({})
-
+        self.use_dora: dict[str, bool] = {}
+        self.osora_magnitude_vector = torch.nn.ModuleDict()  # for DoRA
+        self.ephemeral_gpu_offload: bool = ephemeral_gpu_offload
+        
         self.osora_S = nn.ParameterDict({})
         self.osora_O = nn.ParameterDict({})
         
@@ -30,13 +36,14 @@ class OSoraLayer(BaseTunerLayer):
         self._disable_adapters = False
         self.merged_adapters = []
 
+        self.kwargs = kwargs
+
         base_layer = self.get_base_layer()
         if isinstance(base_layer, nn.Linear):
             in_features, out_features = base_layer.in_features, base_layer.out_features
 
         self.in_features = in_features
         self.out_features = out_features
-        self.kwargs = kwargs
 
     @property
     def merged(self) -> bool:
@@ -46,7 +53,9 @@ class OSoraLayer(BaseTunerLayer):
             self, 
             adapter_name, 
             r,
-            osora_dropout
+            osora_dropout,
+            init_osora_weights,
+            use_dora: bool = False,
     ):
         if r <= 0:
             raise ValueError(f"`r` should be a positive integer value but the value passed is {r}")
@@ -59,13 +68,31 @@ class OSoraLayer(BaseTunerLayer):
 
         self.osora_dropout.update(nn.ModuleDict({adapter_name: osora_dropout_layer}))
 
-        self.osora_O[adapter_name] = nn.Parameter(torch.ones(self.out_features))
+        if isinstance(init_osora_weights, str) and init_osora_weights.lower() == "in_features":
+            self.osora_O[adapter_name] = nn.Parameter(torch.ones(self.in_features))
+        elif isinstance(init_osora_weights, str) and init_osora_weights.lower() == "zeros":
+            self.osora_O[adapter_name] = nn.Parameter(torch.zeros(self.out_features))
+        elif isinstance(init_osora_weights, str) and init_osora_weights.lower() == "kaiming":
+            self.osora_O[adapter_name] = nn.Parameter(torch.empty(self.out_features))
+            nn.init.kaiming_uniform_(self.osora_O[adapter_name].unsqueeze(-1), a=math.sqrt(5))
+            self.osora_O[adapter_name] = self.osora_O[adapter_name].squeeze(-1)
+        elif isinstance(init_osora_weights, str) and init_osora_weights.lower() == "gaussian":
+            self.osora_O[adapter_name] = nn.Parameter(torch.empty(self.out_features))
+            nn.init.normal_(self.osora_O[adapter_name], std=1 / self.r[adapter_name])
+        elif isinstance(init_osora_weights, str) and \
+            (init_osora_weights.lower() == "fix_o" or \
+                init_osora_weights.lower() == "fix_s" or \
+                init_osora_weights.lower() == "default"):
+            self.osora_O[adapter_name] = nn.Parameter(torch.ones(self.out_features))
+        else:
+            raise ValueError(f"Unknown initialization {init_osora_weights=}")
+        
         self.osora_U[adapter_name] = nn.Linear(self.out_features, r, bias=False)
         self.osora_S[adapter_name] = nn.Parameter(torch.ones(r))
         self.osora_V[adapter_name] = nn.Linear(r, self.in_features, bias=False)
         
         weight = self.get_base_layer().weight
-        dtype = weight.dtype
+        dtype, device = weight.dtype, weight.device
         if dtype not in [torch.float32, torch.float16, torch.bfloat16]:
             raise TypeError(
                 "Please initialize OSoRA under float32, float16, or bfloat16. "
@@ -73,6 +100,7 @@ class OSoraLayer(BaseTunerLayer):
             )
         weight = weight.to(torch.float32)
 
+        O = self.osora_O[adapter_name].to(device)
         U, S, Vh = torch.linalg.svd(weight, full_matrices=False)
 
         Ur = U[:, : self.r[adapter_name]]
@@ -83,12 +111,82 @@ class OSoraLayer(BaseTunerLayer):
         self.osora_S[adapter_name].data = Sr
         self.osora_V[adapter_name].weight.data = Vhr.contiguous()
 
-        weight = weight.data - Ur @ torch.diag(Sr) @ Vhr
+        if isinstance(init_osora_weights, str) and init_osora_weights.lower() == "in_features":
+            weight = weight.data - Ur @ torch.diag(Sr) @ Vhr @ torch.diag(O)
+        else:
+            if not (isinstance(init_osora_weights, str) and init_osora_weights.lower() == "zeros"):
+                weight = weight.data - torch.diag(O) @ Ur @ torch.diag(Sr) @ Vhr
         weight = weight.to(dtype)
         self.get_base_layer().weight.data = weight
 
         self._move_adapter_to_device_of_base_layer(adapter_name)
+
+        if use_dora:
+            self.dora_init(adapter_name)
+            self.use_dora[adapter_name] = True
+        else:
+            self.use_dora[adapter_name] = False
+
         self.set_adapter(self.active_adapters)
+
+    def dora_init(self, adapter_name: str) -> None:
+        if not self.osora_magnitude_vector:
+            # first dora layer being added, add osora_magnitude_vector to the list of learnable parameters
+            self.adapter_layer_names = self.adapter_layer_names[:] + ("osora_magnitude_vector",)
+
+        dora_layer = DoraLinearLayer(fan_in_fan_out=getattr(self, "fan_in_fan_out", False))
+        osora_U = self.osora_U[adapter_name].weight
+        osora_V = self.osora_V[adapter_name].weight
+        osora_S = self.osora_S[adapter_name]
+        osora_O = self.osora_O[adapter_name]
+
+        dora_layer.update_layer(
+            base_layer=self.get_base_layer(),
+            osora_U=osora_U,
+            osora_V=osora_V,
+            osora_S=osora_S,
+            osora_O=osora_O,
+        )
+        self.osora_magnitude_vector[adapter_name] = dora_layer
+
+    def _cache_store(self, key: str, value: Any) -> None:
+        self._caches[key] = value
+
+    def _cache_pop(self, key: str) -> Any:
+        value = self._caches.pop(key)
+        return value
+    
+    def _mixed_batch_forward(
+        self, x: torch.Tensor, *args: Any, adapter_names: list[str], **kwargs: Any
+    ) -> torch.Tensor:
+        result = self.base_layer(x, *args, **kwargs)
+        torch_result_dtype = result.dtype
+
+        unique_adapters = set(adapter_names)
+        sub_batch_indices_list = []
+        for adapter in unique_adapters:
+            sub_batch_indices_list.append([index for index, item in enumerate(adapter_names) if item == adapter])
+
+        for i, active_adapter in enumerate(unique_adapters):
+            if active_adapter == "__base__":
+                continue
+            if active_adapter not in self.osora_S.keys():
+                continue
+
+            osora_O = self.osora_O[active_adapter]
+            osora_U = self.osora_U[active_adapter].weight
+            osora_S = self.osora_S[active_adapter]
+            osora_V = self.osora_V[active_adapter].weight
+            dropout = self.osora_dropout[active_adapter]
+
+            sub_batch = x[sub_batch_indices_list[i]].to(osora_V.dtype)
+            if not (isinstance(self.init_osora_weights, str) and self.init_osora_weights.lower() == "in_features"):
+                osora_output = osora_O * F.linear(osora_S * F.linear(dropout(sub_batch), osora_V), osora_U)
+            else:
+                osora_output = F.linear(osora_S * F.linear(osora_O * dropout(sub_batch), osora_V), osora_U)
+            result[sub_batch_indices_list[i]] += osora_output.to(torch_result_dtype)
+
+        return result
 
 
 class Linear(nn.Linear, OSoraLayer):
@@ -101,14 +199,16 @@ class Linear(nn.Linear, OSoraLayer):
         osora_dropout: float = 0.0,
         fan_in_fan_out: bool = False,
         is_target_conv_1d_layer: bool = False,
+        init_osora_weights: str = "default",
+        use_dora: bool = False,
         **kwargs,
     ) -> None:
         super(nn.Linear, self).__init__()
         OSoraLayer.__init__(self, base_layer, **kwargs)
         self.fan_in_fan_out = fan_in_fan_out
-
         self._active_adapter = adapter_name
-        self.update_layer(adapter_name, r, osora_dropout)
+        self.init_osora_weights = init_osora_weights
+        self.update_layer(adapter_name, r, osora_dropout, init_osora_weights, use_dora)
         self.is_target_conv_1d_layer = is_target_conv_1d_layer
 
     def merge(self, safe_merge: bool = False, adapter_names: Optional[List[str]] = None) -> None:
@@ -136,8 +236,21 @@ class Linear(nn.Linear, OSoraLayer):
                     # Note that safe_merge will be slower than the normal merge
                     # because of the copy operation.
                     orig_weights = base_layer.weight.data.clone()
-
-                    orig_weights += self.get_delta_weight(active_adapter)
+                    delta_weight = self.get_delta_weight(active_adapter)
+                    if not self.use_dora[active_adapter]:
+                        orig_weights += delta_weight
+                    else:
+                        # handle dora
+                        # since delta_weight already includes scaling, set it to 1 here
+                        weight_norm = (
+                            self.osora_magnitude_vector[active_adapter]
+                            .get_weight_norm(orig_weights, transpose(delta_weight, self.fan_in_fan_out))
+                            .detach()
+                        )
+                        self._cache_store(f"{active_adapter}-weight_norm", weight_norm)
+                        dora_factor = self.osora_magnitude_vector[active_adapter].weight / weight_norm
+                        dora_factor = transpose(dora_factor.view(-1, 1), self.fan_in_fan_out)
+                        orig_weights += dora_factor * (orig_weights + delta_weight)
 
                     if not torch.isfinite(orig_weights).all():
                         raise ValueError(
@@ -146,9 +259,26 @@ class Linear(nn.Linear, OSoraLayer):
 
                     base_layer.weight.data = orig_weights
                 else:
-                    base_layer.weight.data += self.get_delta_weight(active_adapter)
+                    delta_weight = self.get_delta_weight(active_adapter)
+                    if not self.use_dora[active_adapter]:
+                        base_layer.weight.data += delta_weight
+                    else:
+                        # handle dora
+                        weight_norm = (
+                            self.osora_magnitude_vector[active_adapter]
+                            .get_weight_norm(
+                                base_layer.weight.data, transpose(delta_weight, self.fan_in_fan_out)
+                            )
+                            .detach()
+                        )
+                        self._cache_store(f"{active_adapter}-weight_norm", weight_norm)
+                        dora_factor = self.osora_magnitude_vector[active_adapter].weight / weight_norm
+                        dora_factor = transpose(dora_factor.view(-1, 1), self.fan_in_fan_out)
+                        new_weight = dora_factor * (base_layer.weight.data + delta_weight)
+                        base_layer.weight.data = new_weight
+
                 self.merged_adapters.append(active_adapter)
-                
+
     def unmerge(self) -> None:
         if not self.merged:
             warnings.warn("Already unmerged. Nothing to do.")
@@ -157,8 +287,15 @@ class Linear(nn.Linear, OSoraLayer):
         while len(self.merged_adapters) > 0:
             active_adapter = self.merged_adapters.pop()
             if active_adapter in self.osora_S.keys():
-                base_layer = self.get_base_layer()
-                base_layer.weight.data -= self.get_delta_weight(active_adapter)
+                weight = self.get_base_layer().weight
+                delta_weight = self.get_delta_weight(active_adapter)
+                if not self.use_dora[active_adapter]:
+                    weight.data -= delta_weight
+                else:
+                    weight_norm = self._cache_pop(f"{active_adapter}-weight_norm")
+                    dora_factor = self.osora_magnitude_vector[active_adapter].weight / weight_norm
+                    weight_orig = weight.data / dora_factor.view(-1, 1) - delta_weight
+                    weight.data = weight_orig
     
     def get_delta_weight(self, adapter) -> torch.Tensor:
         """
@@ -184,10 +321,13 @@ class Linear(nn.Linear, OSoraLayer):
             osora_V = osora_V.float()
             osora_O = osora_O.float()
 
-        delta_weight = transpose(torch.diag(osora_O) @ osora_U @ torch.diag(osora_S) @ osora_V, self.fan_in_fan_out)
+        if not (isinstance(self.init_osora_weights, str) and self.init_osora_weights.lower() == "in_features"):
+            output_tensor = transpose(torch.diag(osora_O) @ osora_U @ torch.diag(osora_S) @ osora_V, self.fan_in_fan_out)
+        else:
+            output_tensor = transpose(osora_U @ torch.diag(osora_S) @ osora_V @ torch.diag(osora_O), self.fan_in_fan_out)
 
         if cast_to_fp32:
-            delta_weight = delta_weight.to(dtype)
+            output_tensor = output_tensor.to(dtype)
 
             # cast back the weights
             self.osora_U[adapter].data = osora_U.to(dtype)
@@ -195,19 +335,22 @@ class Linear(nn.Linear, OSoraLayer):
             self.osora_V[adapter].weight.data = osora_V.to(dtype)
             self.osora_O[adapter].data = osora_O.to(dtype)
             
-        return delta_weight
+        return output_tensor
     
-    def forward(self, x: torch.Tensor, *args, **kwargs) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, *args: Any, **kwargs: Any) -> torch.Tensor:
         previous_dtype = x.dtype
-
+        adapter_names = kwargs.pop("adapter_names", None)
         if self.disable_adapters:
             if self.merged:
                 self.unmerge()
             result = self.base_layer(x, *args, **kwargs)
+        elif adapter_names is not None:
+            result = self._mixed_batch_forward(x, *args, adapter_names=adapter_names, **kwargs)
         elif self.merged:
             result = self.base_layer(x, *args, **kwargs)
         else:
             result = self.base_layer(x, *args, **kwargs)
+            torch_result_dtype = result.dtype
             for active_adapter in self.active_adapters:
                 if active_adapter not in self.osora_S.keys():
                     continue
@@ -220,7 +363,21 @@ class Linear(nn.Linear, OSoraLayer):
                 dropout = self.osora_dropout[active_adapter]
                 x = x.to(osora_S.dtype)
                 # result = result + F.linear(dropout(x),torch.diag(osora_O) @ osora_U @ torch.diag(osora_S) @ osora_V
-                result = result + osora_O * F.linear(osora_S * F.linear(dropout(x), osora_V), osora_U)
+                if not (isinstance(self.init_osora_weights, str) and self.init_osora_weights.lower() == "in_features"):
+                    result = result + osora_O * F.linear(osora_S * F.linear(dropout(x), osora_V), osora_U)
+                else:
+                    if not self.use_dora[active_adapter]:
+                        result = result + F.linear(osora_S * F.linear(osora_O * dropout(x), osora_V), osora_U)
+                    else:
+                        x = dropout(x)
+                        result = result + self.osora_magnitude_vector[active_adapter](
+                            x,
+                            osora_U=osora_U,
+                            osora_V=osora_V,
+                            osora_S=osora_S,
+                            osora_O=osora_O,
+                            base_layer=self.get_base_layer(),
+                        )
 
         result = result.to(previous_dtype)
         return result
